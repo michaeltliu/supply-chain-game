@@ -1,27 +1,98 @@
-from orderbook import Orderbook
+from factory import Factory
+from orderbook import Orderbook, OrderbookResponse, PlayerOrder
 from pydantic import BaseModel, Field
-from recipe import Recipe, RECIPES
 from resources import Resource
-from sortedcontainers import SortedDict
+import math
+import random
+
+DEBT_TRANCHES = [
+    (0, 10000, 0.0),
+    (10000, 25000, 0.01),
+    (25000, 100000, 0.02),
+    (100000, float('inf'), 0.035),
+]
 
 class Game(BaseModel):
     players: dict[str, Player] = Field(default_factory=dict)
-    orderbook: dict[Resource, Orderbook] = Field(default_factory=dict)
+    orderbooks: dict[Resource, Orderbook] = Field(default_factory=dict)
+    cpi: float | None = None
+    interest_rate: float = 0
     round_num: int = 0
     waiting_on: set[str] = Field(default_factory=set)
 
+    def start_game(self):
+        self.interest_rate = random.gauss(5, 1.5)
+        self.end_round()
+
+    def submit_player_orderbook_order(self, player_id: str, resource: Resource, order: PlayerOrder):
+        self.orderbooks[resource].player_orders[player_id] = order
+
     def end_round(self):
+        # Resolve all resource orderbooks
+        for res, book in self.orderbooks.items():
+            resolved = book.resolve_player_orders()
+            for player_id, (inv_delta, cash_delta) in resolved.items():
+                p = self.players[player_id]
+                p.inventory[res] += inv_delta
+                p.cash += cash_delta
+
+        # Apply interest to all players' cash/debt
+        for player in self.players.values():
+            if player.cash >= 0:
+                player.cash = round(player.cash * math.exp(self.interest_rate / 4))
+            else:
+                debt = -player.cash
+                new_debt = 0
+                for lower, upper, rate_add in DEBT_TRANCHES:
+                    if debt > lower:
+                        tranche_amount = min(debt, upper) - lower
+                        r = self.interest_rate + rate_add
+                        new_debt += tranche_amount * math.exp(r / 4)
+                    else:
+                        break
+                player.cash = -round(new_debt)
+
+        # TODO: Compute CPI
+        # TODO: Fed decision
+        # TODO: Add NPC order flow
         self.round_num += 1
+        self.waiting_on = set(p.name for p in self.players)
+
+    def convertToResponse(self, player_id: str) -> GameResponse:
+        return GameResponse(
+            player_self=self.players.get(player_id),
+            player_others=list(
+                p.convertToResponse() for pid, p in self.players.items()
+                if pid != player_id),
+            orderbooks={res: book.convertToResponse() for res, book in self.orderbooks.items()},
+            cpi=self.cpi,
+            interest_rate=self.interest_rate,
+            round_num=self.round_num,
+            waiting_on=self.waiting_on
+        )
+
+class GameResponse(BaseModel):
+    player_self: Player | None
+    player_others: list[PlayerResponse]
+    orderbooks: dict[Resource, OrderbookResponse]
+    cpi: float | None
+    interest_rate: float
+    round_num: int
+    waiting_on: set[str]
 
 class Player(BaseModel):
     name: str
     cash: int = 1000
+    contracts: list[Contract] = Field(default_factory=list)
     inventory: dict[Resource, int] = Field(default_factory=dict)
     factories: list[Factory] = Field(default_factory=list)
+    resource_qual: dict[Resource, float] = Field(default_factory=dict)
+    rnd: dict[Resource, int] = Field(default_factory=dict)
+    tooling_inventory: dict[Resource, int] = Field(default_factory=dict)
 
     def build_factory(self, resource: Resource):
         self.factories.append(self, resource)
-        self.cash -= 100
+        self.cash -= 200 # TODO: convert this to manual labor
 
     def resolve_production(self) -> dict[Resource, int]:
         """Runs all of a player's factories for one round, in the correct dependency order,
@@ -70,17 +141,28 @@ class Player(BaseModel):
 
         return net_change
 
-class Factory(BaseModel):
-    output: Resource
-    recipe_index: int = 0
-    max_throughput: int = 0
-    set_throughput: int = 0
+    def convertToResponse(self):
+        return PlayerResponse(
+            name=self.name,
+            cash_log_floor=int(math.log10(self.cash)),
+            contracts=self.contracts,
+            inventory_log_floor={res: int(math.log10(qty)) for res, qty in self.inventory.items()},
+            factories=self.factories
+        )
 
-    def recipe(self) -> Recipe:
-        return RECIPES[self.output][self.recipe_index]
+class PlayerResponse(BaseModel):
+    name: str
+    cash_log_floor: int
+    contracts: list[Contract]
+    inventory_log_floor: dict[Resource, int]
+    factories: list[Factory] # TODO: mask some Factory information when structure is finalized
 
-    def set_recipe_index(self, index: int):
-        self.recipe_index = max(0, min(index, len(RECIPES[self.output]) - 1))
-
-    def update_set_throughput(self, val: int):
-        self.set_throughput = max(0, min(val, self.max_throughput))
+class Contract(BaseModel):
+    resource: Resource
+    counterparty: str
+    completion_due_round: int
+    size: int
+    total_payout: int
+    payout_schedule: list[tuple[int, int]]
+    missing_penalty_per_unit: int
+    size_completed: int = 0

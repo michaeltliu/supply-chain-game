@@ -1,5 +1,6 @@
 from enums import Failure
 from fastapi import FastAPI, Header
+from game import GameResponse
 from pydantic import BaseModel
 from resources import Resource
 from room import Room
@@ -36,7 +37,7 @@ async def join_room(room_code: str, request: JoinRoomRequest):
         if room is None:
             return {'success': False, 'failure_msg': Failure.ROOM_CODE_NOT_FOUND}
         if request.player_name.strip() in {m.name.strip() for m in room.game.players.values()}:
-            return {'success': False, 'failure_msg': 'NAME_TAKEN'}
+            return {'success': False, 'failure_msg': Failure.NAME_TAKEN}
         if room.game.round_num > 0:
             return {'success': False, 'failure_msg': Failure.GAME_IN_PROGRESS}
         player_id = str(uuid.uuid4())
@@ -52,24 +53,25 @@ async def room_waiting_poll(room_code: str):
             return {'success': False, 'failure_msg': Failure.ROOM_CODE_NOT_FOUND}
         return {
             'success': True,
-            'last_update': room.game.round_num,
+            'round_num': room.game.round_num,
             'waiting_on': room.game.waiting_on
         }
 
+class RoomStateResponse(BaseModel):
+    success: bool
+    failure_msg: Optional[Failure] = None
+    game: GameResponse
+
 @app.get("/rooms/{room_code}/state")
-async def room_state(room_code: str):
+async def room_state(room_code: str, x_player_id: str = Header(...)):
     async with redis_store.room_lock(room_code):
         room = await redis_store.load_room(room_code)
         if room is None:
-            return {'success': False, 'failure_msg': Failure.ROOM_CODE_NOT_FOUND}
-        return {
-            'success': True,
-            'last_update': room.last_update,
-            'game': {
-                'players': list(room.game.players.values()), # TODO: mask some of the information
-                'round_num': room.game.round_num
-            }
-        }
+            return RoomStateResponse(success=False, failure_msg=Failure.ROOM_CODE_NOT_FOUND)
+        return RoomStateResponse(
+            success=True,
+            game=room.game.convertToResponse(x_player_id)
+        )
 
 class PlayerTurnRequest(BaseModel):
     build_factories: dict[Resource, int]

@@ -13,9 +13,9 @@ class Orderbook(BaseModel):
     def resolve_player_orders(self) -> dict[str, tuple[int, int]]:
         """Resolve player orders and return inventory and cash deltas by player.
 
-        Each result is ``(inventory_delta, cash_delta)``. Bids therefore
-        produce positive inventory and negative cash, while asks produce the
-        opposite. Orders at each price level are filled pro rata; indivisible
+        Each result is ``player_id -> (inventory_delta, cash_delta)``. Bids
+        therefore produce positive inventory and negative cash, while asks produce
+        the opposite. Orders at each price level are filled pro rata; indivisible
         remainder units go to the players with the largest fractional
         remainders, with player id used as a deterministic tie-breaker.
         """
@@ -92,6 +92,18 @@ class Orderbook(BaseModel):
         resolve_side(is_bid=False)
         self.player_orders.clear()
         return resolved
+
+    def convertToResponse(self) -> OrderbookResponse:
+        return OrderbookResponse(
+            resource=self.resource,
+            bids=list(self.bids.items()),
+            asks=list(self.asks.items())
+        )
+
+class OrderbookResponse(BaseModel):
+    resource: Resource
+    bids: list[tuple[int, int]]
+    asks: list[tuple[int, int]]
 
 class PlayerOrder(BaseModel):
     is_bid: bool

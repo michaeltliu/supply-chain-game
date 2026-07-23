@@ -6,3 +6,4 @@ class Failure(Enum):
     PLAYER_ID_NOT_FOUND = "Player not found"
     EMPTY_PLAYER_NAME = "Empty player name"
     GAME_IN_PROGRESS = "Game already in progress"
+    NAME_TAKEN = "Name taken"
