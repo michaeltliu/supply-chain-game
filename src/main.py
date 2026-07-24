@@ -5,7 +5,7 @@ from errors import (
     NonuniqueClientID
 )
 from fastapi import FastAPI, Header, Request
-from game import GameResponse
+from game import GameResponse, Player
 from pydantic import BaseModel, Field
 from resources import Resource
 from room import Room
@@ -121,12 +121,18 @@ NonNegativeInt = Annotated[int, Field(ge=0)]
 
 class PlayerTurnRequest(BaseModel):
     round_num: int = Field(gt=0)
-    build_factories: dict[ClientID, Resource]
-    auction_bids: dict[NonNegativeInt, NonNegativeInt]
+    build_factories: dict[ClientID, Resource] = Field(default_factory=dict)
+    retool_factories: dict[ClientID, Resource] = Field(default_factory=dict)
+    rnd: dict[Resource, int] = Field(default_factory=dict)
+    auction_bids: dict[NonNegativeInt, NonNegativeInt] = Field(default_factory=dict)
 
 class PlayerTurnResponse(BaseModel):
     success: bool
     failure_msg: Optional[Failure] = None
+    new_player_data: Player
+    auction_bids: list[int] = Field(default_factory=list)
+    build_shortages: dict[Resource, int] = Field(default_factory=dict)
+    retool_shortages: dict[Resource, int] = Field(default_factory=dict)
 
 @app.post("/rooms/{room_code}/player-turn", response_model=PlayerTurnResponse)
 async def player_turn(
@@ -142,4 +148,27 @@ async def player_turn(
             return PlayerTurnResponse(success=False, failure_msg=Failure.PLAYER_ID_NOT_FOUND)
         if request.round_num != room.game.round_num:
             return PlayerTurnResponse(success=False, failure_msg=Failure.WRONG_ROUND)
-    return PlayerTurnResponse(success=True)
+
+        player = room.game.players[x_player_id]
+        build_shortages = player.build_factories(request.build_factories)
+        if build_shortages:
+            return PlayerTurnResponse(
+                success=False,
+                failure_msg=Failure.INSUFFICIENT_INVENTORY,
+                new_player_data=player,
+                build_shortages=build_shortages
+            )
+        retool_shortages = player.retool_factories(request.retool_factories)
+        if retool_shortages:
+            return PlayerTurnResponse(
+                success=False,
+                failure_msg=Failure.INSUFFICIENT_INVENTORY,
+                new_player_data=player,
+                retool_shortages=retool_shortages
+            )
+        room.game.submit_player_auction_bids(request.auction_bids)
+        return PlayerTurnResponse(
+            success=True,
+            new_player_data=player,
+            auction_bids=room.game.get_player_auction_bids(x_player_id)
+        )

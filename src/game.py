@@ -1,8 +1,4 @@
-from errors import (
-    InsufficientInventory,
-    InvalidAuctionParams,
-    NonuniqueClientID
-)
+from collections.abc import Iterable
 from factory import Factory, FactoryResponse
 from orderbook import Orderbook, OrderbookResponse, PlayerOrder
 from pydantic import BaseModel, Field
@@ -30,13 +26,22 @@ class Game(BaseModel):
         self.interest_rate = random.gauss(5, 1.5)
         self.end_round()
 
-    def submit_player_orderbook_order(self, player_id: str, resource: Resource, order: PlayerOrder):
+    def get_player_auction_bids(self, player_id: str) -> list[int | None]:
+        return [a.bids.get(player_id) for a in self.open_auctions]
+
+    def submit_player_orderbook_order(
+        self,
+        player_id: str,
+        resource: Resource,
+        order: PlayerOrder
+    ):
         self.orderbooks[resource].player_orders[player_id] = order
 
-    def submit_player_auction_bid(self, player_id: str, auction_idx: int, bid: int):
-        if auction_idx >= len(self.open_auctions):
-            raise InvalidAuctionParams(bad_index=True)
-        self.open_auctions[auction_idx].bids[player_id] = bid
+    def submit_player_auction_bids(self, player_id: str, bids: dict[int, int]):
+        l = len(self.open_auctions)
+        for auction_idx, bid in bids.items():
+            if auction_idx < l:
+                self.open_auctions[auction_idx].bids[player_id] = bid
 
     def end_round(self):
         # Resolve all resource orderbooks
@@ -114,59 +119,88 @@ class Player(BaseModel):
     rnd: dict[Resource, int] = Field(default_factory=dict)
     tooling_inventory: dict[Resource, int] = Field(default_factory=dict)
 
-    def validate_and_build_factories(self, factories: dict[int, Resource]) -> int:
-        overlap = self.factories.keys() & factories.keys()
-        if overlap:
-            raise NonuniqueClientID(overlap)
+    def _validate_and_consume_factory_resources(
+        self,
+        outputs: Iterable[Resource],
+        additional_cost: dict[Resource, int] = {},
+    ) -> dict:
+        """Verifies that the player has enough resources/tooling inventory to
+        build the requested tooling. Provide additional_cost if the base
+        factory also needs to be built. Only consumes the resources if
+        validation is successful."""
 
-        counts: dict[Resource, int] = dict()
-        for r in factories.values():
-            counts[r] = counts.get(r, 0) + 1
+        cost = dict(additional_cost)
+        output_counts: dict[Resource, int] = {}
+        for output in outputs:
+            output_counts[output] = output_counts.get(output, 0) + 1
+
+        tooling_used: dict[Resource, int] = {}
+        for output, count in output_counts.items():
+            tooling_used[output] = min(
+                count,
+                self.tooling_inventory.get(output, 0),
+            )
+            tooling_to_build = count - tooling_used[output]
+            for resource, quantity in TOOLING_BUILD_COSTS[output].items():
+                cost[resource] = cost.get(resource, 0) + tooling_to_build * quantity
+
+        shortages = {
+            resource: shortage
+            for resource, required in cost.items()
+            if (shortage := required - self.inventory.get(resource, 0)) > 0
+        }
+        if shortages:
+            return shortages
+
+        for resource, required in cost.items():
+            self.inventory[resource] -= required
+        for output, quantity in tooling_used.items():
+            self.tooling_inventory[output] -= quantity
+        return {}
+
+    def build_factories(self, factories: dict[int, Resource]) -> dict[Resource, int]:
+        valid_builds = {
+            k: v for k, v in factories.items()
+            if k not in self.factories
+        }
+
         cost: dict[Resource, int] = {
-            res: qty * len(factories)
+            res: qty * len(valid_builds)
             for res, qty in BASE_FACTORY_COST.items()
         }
-        tooling_used: dict[Resource, int] = {}
-        for f_res, f_qty in counts.items():
-            tooling_used[f_res] = min(
-                f_qty,
-                self.tooling_inventory.get(f_res, 0),
-            )
-            tooling_to_build = f_qty - tooling_used[f_res]
-            for c_res, c_qty in TOOLING_BUILD_COSTS[f_res].items():
-                cost[c_res] = cost.get(c_res, 0) + tooling_to_build * c_qty
-        
-        shortages: dict[Resource, int] = {}
-        for res, req in cost.items():
-            available = self.inventory.get(res, 0)
-            if req > available:
-                shortages[res] = req - available
+        shortages = self._validate_and_consume_factory_resources(
+            valid_builds.values(), cost
+        )
         if shortages:
-            raise InsufficientInventory(shortages)
-        
-        for res, req in cost.items():
-            self.inventory[res] -= req
-        for res, qty in tooling_used.items():
-            self.tooling_inventory[res] -= qty
-        for client_id, res in factories.items():
-            self.factories[client_id] = Factory(output=res, client_id=client_id)
-        return len(factories)
+            return shortages
 
-    def retool_factories(self, factories: dict[int, Resource]) -> int:
-        bad_ids: set[int] = set()
-        for client_id, new_res in factories.items():
-            if client_id in self.factories:
-                old_res = self.factories[client_id].output
-                self.factories[client_id].output = new_res
-                self.tooling_inventory[old_res] = self.tooling_inventory.get(old_res, 0) + 1
-            else:
-                bad_ids.add(client_id)
-        return bad_ids
+        for client_id, res in valid_builds.items():
+            self.factories[client_id] = Factory(output=res, client_id=client_id)
+        return {}
+
+    def retool_factories(self, factories: dict[int, Resource]) -> dict[Resource, int]:
+        valid_retools = {
+            client_id: new_output
+            for client_id, new_output in factories.items()
+            if client_id in self.factories
+            and self.factories[client_id].output != new_output
+        }
+
+        shortages = self._validate_and_consume_factory_resources(valid_retools.values())
+        if shortages:
+            return shortages
+
+        for client_id, new_output in valid_retools.items():
+            factory = self.factories[client_id]
+            old_output = factory.output
+            factory.output = new_output
+            self.tooling_inventory[old_output] = self.tooling_inventory.get(old_output, 0) + 1
+        return {}
 
     def resolve_production(self) -> dict[Resource, int]:
         """Runs all of a player's factories for one round, in the correct dependency order,
         updates self.inventory, and returns the net change."""
-        factories = self.factories
+        factories = self.factories.values()
         outputs = {f.output for f in factories} # outputs actually produced by player's factories
 
         dependents: dict[Resource, set[Resource]] = {o: set() for o in outputs}
@@ -246,9 +280,11 @@ class Contract(ContractResponse):
 class AuctionResponse(BaseModel):
     contract: ContractResponse
     starting_price: int
+    own_bid: int | None
 
-class Auction(AuctionResponse):
+class Auction(BaseModel):
     contract: Contract
+    starting_price: int
     bids: dict[str, int] = Field(default_factory=dict)
 
     def resolve_auction(self) -> tuple[str, int]:
@@ -265,8 +301,9 @@ class Auction(AuctionResponse):
                 second_price = bid
         return winner_id, second_price
 
-    def convertToResponse(self) -> AuctionResponse:
+    def convertToResponse(self, player_id) -> AuctionResponse:
         return AuctionResponse(
-            auction_no=self.auction_no,
-            contract=self.contract.convertToResponse()
+            contract=self.contract.convertToResponse(),
+            starting_price=self.starting_price,
+            own_bid=self.bids.get(player_id)
         )
