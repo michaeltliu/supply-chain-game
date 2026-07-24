@@ -166,3 +166,15 @@ RESOURCE_RND_COSTS: dict[Resource, tuple[int]] = {
     FinishedGoods.POWER: (2500, 1000),
     FinishedGoods.SMARTPHONE: (5000, 2500)
 }
+
+BASE_FACTORY_COST: dict[Resource, int] = {
+    RawMaterials.LUMBER: 25,
+    RefinedGoods.STEEL: 10,
+    RefinedGoods.WIRING: 10,
+}
+
+TOOLING_BUILD_COSTS: dict[Resource, dict[Resource, int]] = {
+    RawMaterials.ALUMINUM: {
+
+    }
+}

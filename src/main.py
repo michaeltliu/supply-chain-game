@@ -1,14 +1,43 @@
-from enums import Failure
-from fastapi import FastAPI, Header
+from errors import (
+    Failure,
+    InsufficientInventory,
+    InvalidAuctionParams,
+    NonuniqueClientID
+)
+from fastapi import FastAPI, Header, Request
 from game import GameResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from resources import Resource
 from room import Room
-from typing import Optional
+from typing import Annotated, Optional
 import redis_store
 import uuid
 
 app = FastAPI()
+
+@app.exception_handler(InsufficientInventory)
+async def insufficient_inventory_handler(_request: Request, exc: InsufficientInventory):
+    return {
+        'success': False,
+        'failure_msg': 'INSUFFICIENT_INVENTORY',
+        'shortages': exc.shortages
+    }
+
+@app.exception_handler(InvalidAuctionParams)
+async def invalid_auction_params_handler(_request: Request, exc: InvalidAuctionParams):
+    return {
+        'success': False,
+        'failure_msg': 'INVALID_AUCTION_PARAMS',
+        'bad_index': exc.bad_index,
+    }
+
+@app.exception_handler(NonuniqueClientID)
+async def nonunique_client_id_handler(_request: Request, exc: NonuniqueClientID):
+    return {
+        'success': False,
+        'failure_msg': 'NONUNIQUE_CLIENT_ID',
+        'overlap': exc.overlap
+    }
 
 class CreateRoomRequest(BaseModel):
     player_name: str
@@ -45,6 +74,20 @@ async def join_room(room_code: str, request: JoinRoomRequest):
         await redis_store.save_room(room)
     return {'success': True, 'player_id': player_id}
 
+@app.post("/rooms/{room_code}/start-game")
+async def start_game(room_code: str, x_player_id: str = Header(...)):
+    async with redis_store.room_lock(room_code):
+        room = await redis_store.load_room(room_code)
+        if room is None:
+            return {'success': False, 'failure_msg': Failure.ROOM_CODE_NOT_FOUND}
+        if room.owner_id != x_player_id:
+            return {'success': False, 'failure_msg': Failure.REQUIRES_OWNER}
+        if room.game.round_num > 0:
+            return {'success': False, 'failure_msg': Failure.GAME_IN_PROGRESS}
+        room.game.start_game()
+        await redis_store.save_room(room)
+    return {'success': True}
+
 @app.get("/rooms/{room_code}/waiting-poll")
 async def room_waiting_poll(room_code: str):
     async with redis_store.room_lock(room_code):
@@ -73,8 +116,13 @@ async def room_state(room_code: str, x_player_id: str = Header(...)):
             game=room.game.convertToResponse(x_player_id)
         )
 
+ClientID = Annotated[int, Field(ge=0, lt=2**31)]
+NonNegativeInt = Annotated[int, Field(ge=0)]
+
 class PlayerTurnRequest(BaseModel):
-    build_factories: dict[Resource, int]
+    round_num: int = Field(gt=0)
+    build_factories: dict[ClientID, Resource]
+    auction_bids: dict[NonNegativeInt, NonNegativeInt]
 
 class PlayerTurnResponse(BaseModel):
     success: bool
@@ -90,4 +138,8 @@ async def player_turn(
         room = await redis_store.load_room(room_code)
         if room is None:
             return PlayerTurnResponse(success=False, failure_msg=Failure.ROOM_CODE_NOT_FOUND)
+        if x_player_id not in room.game.players:
+            return PlayerTurnResponse(success=False, failure_msg=Failure.PLAYER_ID_NOT_FOUND)
+        if request.round_num != room.game.round_num:
+            return PlayerTurnResponse(success=False, failure_msg=Failure.WRONG_ROUND)
     return PlayerTurnResponse(success=True)

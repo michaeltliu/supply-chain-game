@@ -1,7 +1,12 @@
-from factory import Factory
+from errors import (
+    InsufficientInventory,
+    InvalidAuctionParams,
+    NonuniqueClientID
+)
+from factory import Factory, FactoryResponse
 from orderbook import Orderbook, OrderbookResponse, PlayerOrder
 from pydantic import BaseModel, Field
-from resources import Resource
+from resources import Resource, BASE_FACTORY_COST, TOOLING_BUILD_COSTS
 import math
 import random
 
@@ -13,12 +18,13 @@ DEBT_TRANCHES = [
 ]
 
 class Game(BaseModel):
+    round_num: int = 0
     players: dict[str, Player] = Field(default_factory=dict)
     orderbooks: dict[Resource, Orderbook] = Field(default_factory=dict)
     cpi: float | None = None
     interest_rate: float = 0
-    round_num: int = 0
-    waiting_on: set[str] = Field(default_factory=set)
+    open_auctions: list[Auction] = Field(default_factory=list)
+    waiting_on: set[str] = Field(default_factory=set) # player names
 
     def start_game(self):
         self.interest_rate = random.gauss(5, 1.5)
@@ -26,6 +32,11 @@ class Game(BaseModel):
 
     def submit_player_orderbook_order(self, player_id: str, resource: Resource, order: PlayerOrder):
         self.orderbooks[resource].player_orders[player_id] = order
+
+    def submit_player_auction_bid(self, player_id: str, auction_idx: int, bid: int):
+        if auction_idx >= len(self.open_auctions):
+            raise InvalidAuctionParams(bad_index=True)
+        self.open_auctions[auction_idx].bids[player_id] = bid
 
     def end_round(self):
         # Resolve all resource orderbooks
@@ -35,6 +46,16 @@ class Game(BaseModel):
                 p = self.players[player_id]
                 p.inventory[res] += inv_delta
                 p.cash += cash_delta
+
+        # Resolve all open auctions
+        for auction in self.open_auctions:
+            winner_id, bid = auction.resolve_auction()
+            if not winner_id:
+                continue
+            contract = auction.contract
+            contract.payout = bid
+            self.players[winner_id].contracts.append(contract)
+        self.open_auctions.clear()
 
         # Apply interest to all players' cash/debt
         for player in self.players.values():
@@ -55,11 +76,13 @@ class Game(BaseModel):
         # TODO: Compute CPI
         # TODO: Fed decision
         # TODO: Add NPC order flow
+        # TODO: Add new contract auctions
         self.round_num += 1
-        self.waiting_on = set(p.name for p in self.players)
+        self.waiting_on = set(p.name for p in self.players.values())
 
     def convertToResponse(self, player_id: str) -> GameResponse:
         return GameResponse(
+            round_num=self.round_num,
             player_self=self.players.get(player_id),
             player_others=list(
                 p.convertToResponse() for pid, p in self.players.items()
@@ -67,17 +90,18 @@ class Game(BaseModel):
             orderbooks={res: book.convertToResponse() for res, book in self.orderbooks.items()},
             cpi=self.cpi,
             interest_rate=self.interest_rate,
-            round_num=self.round_num,
+            open_auctions=[auction.convertToResponse() for auction in self.open_auctions],
             waiting_on=self.waiting_on
         )
 
 class GameResponse(BaseModel):
+    round_num: int
     player_self: Player | None
     player_others: list[PlayerResponse]
     orderbooks: dict[Resource, OrderbookResponse]
     cpi: float | None
     interest_rate: float
-    round_num: int
+    open_auctions: list[AuctionResponse]
     waiting_on: set[str]
 
 class Player(BaseModel):
@@ -85,14 +109,59 @@ class Player(BaseModel):
     cash: int = 1000
     contracts: list[Contract] = Field(default_factory=list)
     inventory: dict[Resource, int] = Field(default_factory=dict)
-    factories: list[Factory] = Field(default_factory=list)
+    factories: dict[int, Factory] = Field(default_factory=dict)
     resource_qual: dict[Resource, float] = Field(default_factory=dict)
     rnd: dict[Resource, int] = Field(default_factory=dict)
     tooling_inventory: dict[Resource, int] = Field(default_factory=dict)
 
-    def build_factory(self, resource: Resource):
-        self.factories.append(self, resource)
-        self.cash -= 200 # TODO: convert this to manual labor
+    def validate_and_build_factories(self, factories: dict[int, Resource]) -> int:
+        overlap = self.factories.keys() & factories.keys()
+        if overlap:
+            raise NonuniqueClientID(overlap)
+
+        counts: dict[Resource, int] = dict()
+        for r in factories.values():
+            counts[r] = counts.get(r, 0) + 1
+        cost: dict[Resource, int] = {
+            res: qty * len(factories)
+            for res, qty in BASE_FACTORY_COST.items()
+        }
+        tooling_used: dict[Resource, int] = {}
+        for f_res, f_qty in counts.items():
+            tooling_used[f_res] = min(
+                f_qty,
+                self.tooling_inventory.get(f_res, 0),
+            )
+            tooling_to_build = f_qty - tooling_used[f_res]
+            for c_res, c_qty in TOOLING_BUILD_COSTS[f_res].items():
+                cost[c_res] = cost.get(c_res, 0) + tooling_to_build * c_qty
+        
+        shortages: dict[Resource, int] = {}
+        for res, req in cost.items():
+            available = self.inventory.get(res, 0)
+            if req > available:
+                shortages[res] = req - available
+        if shortages:
+            raise InsufficientInventory(shortages)
+        
+        for res, req in cost.items():
+            self.inventory[res] -= req
+        for res, qty in tooling_used.items():
+            self.tooling_inventory[res] -= qty
+        for client_id, res in factories.items():
+            self.factories[client_id] = Factory(output=res, client_id=client_id)
+        return len(factories)
+
+    def retool_factories(self, factories: dict[int, Resource]) -> int:
+        bad_ids: set[int] = set()
+        for client_id, new_res in factories.items():
+            if client_id in self.factories:
+                old_res = self.factories[client_id].output
+                self.factories[client_id].output = new_res
+                self.tooling_inventory[old_res] = self.tooling_inventory.get(old_res, 0) + 1
+            else:
+                bad_ids.add(client_id)
+        return bad_ids
 
     def resolve_production(self) -> dict[Resource, int]:
         """Runs all of a player's factories for one round, in the correct dependency order,
@@ -145,24 +214,59 @@ class Player(BaseModel):
         return PlayerResponse(
             name=self.name,
             cash_log_floor=int(math.log10(self.cash)),
-            contracts=self.contracts,
+            contracts=[c.convertToResponse() for c in self.contracts],
             inventory_log_floor={res: int(math.log10(qty)) for res, qty in self.inventory.items()},
-            factories=self.factories
+            factories=list(f.convertToResponse() for f in self.factories.values()),
+            resource_qual=self.resource_qual
         )
 
 class PlayerResponse(BaseModel):
     name: str
     cash_log_floor: int
-    contracts: list[Contract]
+    contracts: list[ContractResponse]
     inventory_log_floor: dict[Resource, int]
-    factories: list[Factory] # TODO: mask some Factory information when structure is finalized
+    factories: list[FactoryResponse] # TODO: mask some Factory information when structure is finalized
+    resource_qual: dict[Resource, float]
 
-class Contract(BaseModel):
+class ContractResponse(BaseModel):
     resource: Resource
     counterparty: str
     completion_due_round: int
-    size: int
-    total_payout: int
-    payout_schedule: list[tuple[int, int]]
+    total_size: int
     missing_penalty_per_unit: int
+    payout: int = 0
+    payout_schedule: list[tuple[int, float]]
+
+class Contract(ContractResponse):
     size_completed: int = 0
+
+    def convertToResponse(self) -> ContractResponse:
+        return ContractResponse(**self.model_dump())
+
+class AuctionResponse(BaseModel):
+    contract: ContractResponse
+    starting_price: int
+
+class Auction(AuctionResponse):
+    contract: Contract
+    bids: dict[str, int] = Field(default_factory=dict)
+
+    def resolve_auction(self) -> tuple[str, int]:
+        # TODO: integrate players' resource quality into the decision?
+        first_price = self.starting_price
+        second_price = float('inf')
+        winner_id = ""
+        for player_id, bid in self.bids.items():
+            if bid < first_price:
+                second_price = first_price
+                first_price = bid
+                winner_id = player_id
+            elif bid < second_price:
+                second_price = bid
+        return winner_id, second_price
+
+    def convertToResponse(self) -> AuctionResponse:
+        return AuctionResponse(
+            auction_no=self.auction_no,
+            contract=self.contract.convertToResponse()
+        )
