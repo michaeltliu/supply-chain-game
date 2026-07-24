@@ -2,7 +2,14 @@ from collections.abc import Iterable
 from factory import Factory, FactoryResponse
 from orderbook import Orderbook, OrderbookResponse, PlayerOrder
 from pydantic import BaseModel, Field
-from resources import Resource, BASE_FACTORY_COST, TOOLING_BUILD_COSTS
+from resources import (
+    FactoryResource,
+    Labor,
+    Resource,
+    BASE_FACTORY_COST,
+    RESOURCE_RND_COSTS,
+    TOOLING_BUILD_COSTS,
+)
 import math
 import random
 
@@ -23,7 +30,9 @@ class Game(BaseModel):
     waiting_on: set[str] = Field(default_factory=set) # player names
 
     def start_game(self):
-        self.interest_rate = random.gauss(5, 1.5)
+        for res in Resource:
+            self.orderbooks[res] = Orderbook(resource=res)
+        self.interest_rate = random.gauss(0.05, 0.015)
         self.end_round()
 
     def get_player_auction_bids(self, player_id: str) -> list[int | None]:
@@ -62,6 +71,8 @@ class Game(BaseModel):
             self.players[winner_id].contracts.append(contract)
         self.open_auctions.clear()
 
+        # TODO: Compute CPI
+
         # Apply interest to all players' cash/debt
         for player in self.players.values():
             if player.cash >= 0:
@@ -78,7 +89,6 @@ class Game(BaseModel):
                         break
                 player.cash = -round(new_debt)
 
-        # TODO: Compute CPI
         # TODO: Fed decision
         # TODO: Add NPC order flow
         # TODO: Add new contract auctions
@@ -116,7 +126,7 @@ class Player(BaseModel):
     inventory: dict[Resource, int] = Field(default_factory=dict)
     factories: dict[int, Factory] = Field(default_factory=dict)
     resource_qual: dict[Resource, float] = Field(default_factory=dict)
-    rnd: dict[Resource, int] = Field(default_factory=dict)
+    rnd: dict[FactoryResource, int] = Field(default_factory=dict)
     tooling_inventory: dict[Resource, int] = Field(default_factory=dict)
 
     def _validate_and_consume_factory_resources(
@@ -158,10 +168,11 @@ class Player(BaseModel):
             self.tooling_inventory[output] -= quantity
         return {}
 
-    def build_factories(self, factories: dict[int, Resource]) -> dict[Resource, int]:
+    def build_factories(self, factories: dict[int, FactoryResource]) -> dict[Resource, int]:
         valid_builds = {
-            k: v for k, v in factories.items()
-            if k not in self.factories
+            client_id: output for client_id, output in factories.items()
+            if client_id not in self.factories
+            and self.rnd.get(output, 0) > 0
         }
 
         cost: dict[Resource, int] = {
@@ -178,12 +189,13 @@ class Player(BaseModel):
             self.factories[client_id] = Factory(output=res, client_id=client_id)
         return {}
 
-    def retool_factories(self, factories: dict[int, Resource]) -> dict[Resource, int]:
+    def retool_factories(self, factories: dict[int, FactoryResource]) -> dict[Resource, int]:
         valid_retools = {
             client_id: new_output
             for client_id, new_output in factories.items()
             if client_id in self.factories
             and self.factories[client_id].output != new_output
+            and self.rnd.get(new_output, 0) > 0
         }
 
         shortages = self._validate_and_consume_factory_resources(valid_retools.values())
@@ -195,6 +207,29 @@ class Player(BaseModel):
             old_output = factory.output
             factory.output = new_output
             self.tooling_inventory[old_output] = self.tooling_inventory.get(old_output, 0) + 1
+        return {}
+
+    def perform_rnd(self, upgrades: dict[FactoryResource, int]) -> dict[Resource, int]:
+        """Apply all requested research levels if corporate labor covers the total cost."""
+        total_cost = 0
+        for resource, levels in upgrades.items():
+            if levels <= 0:
+                continue
+
+            first_level_cost, successive_level_cost = RESOURCE_RND_COSTS[resource]
+            current_level = self.rnd.get(resource, 0)
+            if current_level == 0:
+                total_cost += first_level_cost + (levels - 1) * successive_level_cost
+            else:
+                total_cost += levels * successive_level_cost
+
+        corporate_labor = self.inventory.get(Labor.CORPORATE, 0)
+        if total_cost > corporate_labor:
+            return {Labor.CORPORATE: total_cost - corporate_labor}
+
+        self.inventory[Labor.CORPORATE] = corporate_labor - total_cost
+        for resource, levels in upgrades.items():
+            self.rnd[resource] = self.rnd.get(resource, 0) + levels
         return {}
 
     def resolve_production(self) -> dict[Resource, int]:

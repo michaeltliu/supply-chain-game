@@ -5,9 +5,10 @@ from errors import (
     NonuniqueClientID
 )
 from fastapi import FastAPI, Header, Request
+from factory import Factory
 from game import GameResponse, Player
 from pydantic import BaseModel, Field
-from resources import Resource
+from resources import FactoryResource, Resource
 from room import Room
 from typing import Annotated, Optional
 import redis_store
@@ -121,9 +122,9 @@ NonNegativeInt = Annotated[int, Field(ge=0)]
 
 class PlayerTurnRequest(BaseModel):
     round_num: int = Field(gt=0)
-    build_factories: dict[ClientID, Resource] = Field(default_factory=dict)
-    retool_factories: dict[ClientID, Resource] = Field(default_factory=dict)
-    rnd: dict[Resource, int] = Field(default_factory=dict)
+    perform_rnd: dict[FactoryResource, NonNegativeInt] = Field(default_factory=dict)
+    build_factories: dict[ClientID, FactoryResource] = Field(default_factory=dict)
+    retool_factories: dict[ClientID, FactoryResource] = Field(default_factory=dict)
     auction_bids: dict[NonNegativeInt, NonNegativeInt] = Field(default_factory=dict)
 
 class PlayerTurnResponse(BaseModel):
@@ -133,6 +134,7 @@ class PlayerTurnResponse(BaseModel):
     auction_bids: list[int] = Field(default_factory=list)
     build_shortages: dict[Resource, int] = Field(default_factory=dict)
     retool_shortages: dict[Resource, int] = Field(default_factory=dict)
+    rnd_shortages: dict[Resource, int] = Field(default_factory=dict)
 
 @app.post("/rooms/{room_code}/player-turn", response_model=PlayerTurnResponse)
 async def player_turn(
@@ -150,6 +152,14 @@ async def player_turn(
             return PlayerTurnResponse(success=False, failure_msg=Failure.WRONG_ROUND)
 
         player = room.game.players[x_player_id]
+        rnd_shortages = player.perform_rnd(request.rnd)
+        if rnd_shortages:
+            return PlayerTurnResponse(
+                success=False,
+                failure_msg=Failure.INSUFFICIENT_INVENTORY,
+                new_player_data=player,
+                rnd_shortages=rnd_shortages
+            )
         build_shortages = player.build_factories(request.build_factories)
         if build_shortages:
             return PlayerTurnResponse(

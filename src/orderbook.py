@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from resources import Resource
 from sortedcontainers import SortedDict
 
@@ -6,9 +6,9 @@ class Orderbook(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     resource: Resource
-    bids: SortedDict[int, int] # price -> volume
-    asks: SortedDict[int, int] # price -> volume
-    player_orders: dict[str, PlayerOrder]
+    bids: SortedDict[int, int] = Field(default_factory=SortedDict) # price -> volume
+    asks: SortedDict[int, int] = Field(default_factory=SortedDict) # price -> volume
+    player_orders: dict[str, PlayerOrder] = Field(default_factory=dict)
 
     def resolve_player_orders(self) -> dict[str, tuple[int, int]]:
         """Resolve player orders and return inventory and cash deltas by player.

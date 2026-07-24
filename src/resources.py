@@ -42,7 +42,8 @@ class FinishedGoods(str, Enum):
     POWER = "power" # TODO: consider balancing power, each fuel type needs different plant
     SMARTPHONE = "smartphone"
 
-Resource = FinishedGoods | RefinedGoods | RawMaterials | Labor
+FactoryResource = FinishedGoods | RefinedGoods | RawMaterials
+Resource = FactoryResource | Labor
 
 
 class Recipe(BaseModel):
@@ -133,7 +134,7 @@ RECIPES: dict[Resource, list[Recipe]] = {
     ]
 }
 
-RESOURCE_RND_COSTS: dict[Resource, tuple[int]] = {
+RESOURCE_RND_COSTS: dict[FactoryResource, tuple[int]] = {
     RawMaterials.ALUMINUM: (60, 30),
     RawMaterials.COAL: (40, 20),
     RawMaterials.COPPER: (60, 30),
@@ -175,6 +176,6 @@ BASE_FACTORY_COST: dict[Resource, int] = {
 
 TOOLING_BUILD_COSTS: dict[Resource, dict[Resource, int]] = {
     RawMaterials.ALUMINUM: {
-
+        RawMaterials.LUMBER: 1
     }
 }
